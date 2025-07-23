@@ -1,105 +1,137 @@
+import os, sys, subprocess, venv
+from pathlib import Path
+
+# Constants
+PROJECT = Path("fastapi-whisper")
+APP_DIR = PROJECT / "app"
+VENV_DIR = PROJECT / ".venv"
+
+def run(cmd, cwd=None):
+    print(f"Running: {' '.join(map(str, cmd))} (cwd={cwd or os.getcwd()})")
+    subprocess.check_call(cmd, cwd=cwd)
+
+def write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    print(f"Written: {path}")
+
+def main():
+    # Step 1: Create project and app directories
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    (APP_DIR / "__init__.py").touch(exist_ok=True)
+
+    # Step 2: Create virtual environment
+    if not VENV_DIR.exists():
+        print("Creating virtual environment...")
+        venv.create(str(VENV_DIR), with_pip=True, clear=True)
+
+    pip = VENV_DIR / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
+    python = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+    # Step 3: Write requirements.txt
+    REQS = """\
+fastapi==0.110.0
+uvicorn[standard]==0.30.1
+torch==2.3.0
+torchaudio==2.3.0
+soundfile==0.12.1
+transformers==4.43.1
+huggingface_hub[hf_transfer]==0.23.3
+onnxruntime==1.22.1
+numpy==1.26.4
+python-multipart==0.0.9
+""".strip()
+    write(PROJECT / "requirements.txt", REQS)
+
+    # Step 4: Install requirements
+    print("Upgrading pip...")
+    run([python, "-m", "pip", "install", "--upgrade", "pip"])
+    print("Installing requirements...")
+    run([str(pip), "install", "-r", "requirements.txt"], cwd=str(PROJECT))
+
+    # Step 5: Write settings.py
+    SETTINGS = """\
+WHISPER_MODEL = "openai/whisper-base"
+INDIC_MODEL = "ai4bharat/indic-conformer-600m-multilingual"
+CACHE_DIR = None
+"""
+    write(APP_DIR / "settings.py", SETTINGS)
+
+    # Step 6: Write main.py
+    MAIN = '''\
 from fastapi import FastAPI, UploadFile, File, HTTPException
-import torchaudio
-import torch
-from transformers import WhisperProcessor, WhisperForConditionalGeneration, AutoModel
-import tempfile
-import os
-from pydantic import BaseModel
+import torch, torchaudio, tempfile, os, re, soundfile
+from transformers import WhisperForConditionalGeneration, WhisperProcessor, AutoModel
+from . import settings
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Language-Aware Audio Transcription API",
-    description="Detect language and transcribe audio using Whisper + Indic Conformer",
-    version="1.0.0"
-)
-
-# Device setup
+app = FastAPI(title="Whisper-Base Transcription API")
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
 
-# Load models (will happen when first endpoint is called)
-lang_id_model = None
-lang_id_processor = None
-model = None
+_w_model = _w_proc = _indic = None
+LANG_RE = re.compile(r"<\\|([a-z]{2})\\|>")
 
 def load_models():
-    global lang_id_model, lang_id_processor, model
-    if lang_id_model is None:
-        print("Loading models... This may take a while.")
-        lang_id_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large").to(device)
-        lang_id_processor = WhisperProcessor.from_pretrained("openai/whisper-large")
-        model = AutoModel.from_pretrained("ai4bharat/indic-conformer-600m-multilingual", trust_remote_code=True)
-        print("Models loaded successfully!")
-
-class TranscriptionResponse(BaseModel):
-    detected_language: str
-    ctc_transcription: str
-    rnnt_transcription: str
-    success: bool
-    message: str
-
-def detect_language(audio_path):
-    waveform, sr = torchaudio.load(audio_path)
-    waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=16000)
-    inputs = lang_id_processor(waveform.squeeze(), sampling_rate=16000, return_tensors="pt").to(device)
-
-    start_token_id = lang_id_processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
-    decoder_input_ids = torch.tensor([[start_token_id]], device=device)
-
-    with torch.no_grad():
-        outputs = lang_id_model.generate(
-            inputs["input_features"],
-            decoder_input_ids=decoder_input_ids,
-            max_new_tokens=1,
+    global _w_model, _w_proc, _indic
+    if _w_model is None:
+        _w_model = WhisperForConditionalGeneration.from_pretrained(
+            settings.WHISPER_MODEL, cache_dir=settings.CACHE_DIR
+        ).to(device)
+        _w_proc = WhisperProcessor.from_pretrained(
+            settings.WHISPER_MODEL, cache_dir=settings.CACHE_DIR
+        )
+        _indic = AutoModel.from_pretrained(
+            settings.INDIC_MODEL, trust_remote_code=True, cache_dir=settings.CACHE_DIR
         )
 
-    lang_token = lang_id_processor.tokenizer.decode(outputs[0], skip_special_tokens=False)
-    lang_code = lang_token.replace("<|", "").replace("|>", "").strip()
-    return lang_code, waveform.to(device)
+def detect_language(wav_path: str):
+    wav, sr = torchaudio.load(wav_path, format="wav")
+    wav = torchaudio.functional.resample(wav, sr, 16_000)
+    inputs = _w_proc(wav.squeeze(), sampling_rate=16_000, return_tensors="pt").to(device)
+    start_id = _w_proc.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+    dec_in = torch.tensor([[start_id]], device=device)
+    ids = _w_model.generate(inputs["input_features"], decoder_input_ids=dec_in, max_new_tokens=2)[0]
+    token_str = _w_proc.tokenizer.decode(ids, skip_special_tokens=False)
+    lang = LANG_RE.findall(token_str)[-1]
+    return lang, wav.to(device)
 
 @app.get("/")
 async def root():
-    return {
-        "message": "Language-Aware Audio Transcription API", 
-        "docs": "/docs",
-        "device": device,
-        "status": "ready"
-    }
+    return {"msg": "Whisper-Base API online", "docs": "/docs"}
 
-@app.post("/transcribe", response_model=TranscriptionResponse)
-async def transcribe_audio(audio_file: UploadFile = File(...)):
-    """Upload an audio file and get language detection + transcription"""
-    
-    load_models()  # Load models on first use
-    
-    if not audio_file.content_type or not audio_file.content_type.startswith('audio/'):
-        raise HTTPException(status_code=400, detail="Please upload an audio file")
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-        content = await audio_file.read()
-        temp_file.write(content)
-        temp_audio_path = temp_file.name
-    
+@app.post("/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    load_models()
+    if not (audio.content_type and audio.content_type.startswith("audio/")):
+        raise HTTPException(400, "Upload an audio file")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
     try:
-        lang_code, wav = detect_language(temp_audio_path)
-        transcription_ctc = model(wav, lang_code, "ctc")
-        transcription_rnnt = model(wav, lang_code, "rnnt")
-        
-        os.unlink(temp_audio_path)
-        
-        return TranscriptionResponse(
-            detected_language=lang_code,
-            ctc_transcription=transcription_ctc,
-            rnnt_transcription=transcription_rnnt,
-            success=True,
-            message="Transcription completed successfully"
-        )
-        
-    except Exception as e:
-        if os.path.exists(temp_audio_path):
-            os.unlink(temp_audio_path)
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        lang, wav = detect_language(tmp_path)
+        ctc = _indic(wav, lang, "ctc")
+        rnnt = _indic(wav, lang, "rnnt")
+        return {"language": lang, "ctc": ctc, "rnnt": rnnt}
+    finally:
+        os.unlink(tmp_path)
+'''.lstrip()
+    write(APP_DIR / "main.py", MAIN)
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "device": device, "models_loaded": lang_id_model is not None}
+    # Step 7: Write development run script (optional, for Windows PowerShell)
+    write(PROJECT / "run_dev.ps1", 'python -m uvicorn app.main:app --reload')
+
+    print("\nSetup complete!\n")
+    print(f"To activate the environment and run the API (on Windows):")
+    print(f"cd {PROJECT}")
+    print(r".\.venv\Scripts\activate")
+    print("uvicorn app.main:app --reload\n")
+    print(f"On Linux/Mac:")
+    print(f"cd {PROJECT}")
+    print(r"source .venv/bin/activate")
+    print("uvicorn app.main:app --reload\n")
+    print("Or, to run directly (no activation):")
+    print(f"{python} -m uvicorn app.main:app --reload")
+    print("\nYou can now develop your FastAPI app in 'fastapi-whisper/app/main.py'.")
+
+if __name__ == "__main__":
+    main()
+
