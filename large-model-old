@@ -1,0 +1,865 @@
+import os
+import uuid
+import logging
+import traceback
+from typing import Optional, Dict, Tuple
+import torch
+import torchaudio
+import librosa
+import soundfile as sf
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from transformers import WhisperForConditionalGeneration, WhisperProcessor, AutoModel
+from huggingface_hub import hf_hub_download
+import tempfile
+import asyncio
+from contextlib import asynccontextmanager
+
+
+# Import configuration
+from config import Config
+
+
+# Configure logging with better formatting
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# Global variables for models
+whisper_model = None
+whisper_processor = None
+indic_model = None
+models_loading = False
+models_loaded = False
+
+
+# Use configuration values
+WHISPER_TO_INDIC_MAPPING = Config.WHISPER_TO_INDIC_MAPPING
+SUPPORTED_FORMATS = Config.SUPPORTED_FORMATS
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    # Startup
+    logger.info("Starting Multi-Indic Speech-to-Text Service")
+    logger.info(f"Device: {Config.get_device()}")
+    logger.info(f"Using Whisper model: {Config.WHISPER_MODEL}")
+    logger.info(f"Using Indic model: {Config.INDIC_MODEL}")
+    await load_models_async()
+    yield
+    # Shutdown
+    logger.info("Shutting down Multi-Indic Speech-to-Text Service")
+
+
+app = FastAPI(
+    title="Multi-Indic Language Speech-to-Text API",
+    description="Advanced FastAPI service for transcribing audio in 22+ Indian languages with native script output",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Enhanced model checking functions
+def check_all_models_loaded() -> Dict[str, object]:
+    """Check the loading status of all required models."""
+    return {
+        "whisper_model_loaded": whisper_model is not None,
+        "whisper_processor_loaded": whisper_processor is not None,
+        "indic_model_loaded": indic_model is not None,
+        "all_models_ready": all([
+            whisper_model is not None,
+            whisper_processor is not None,
+            indic_model is not None
+        ]),
+        "models_loading": models_loading,
+        "device": Config.get_device(),
+        "gpu_available": torch.cuda.is_available()
+    }
+
+
+def require_whisper_model() -> bool:
+    """Ensure whisper_model is loaded and ready."""
+    if whisper_model is None:
+        logger.warning("Whisper model not loaded yet.")
+        return False
+    return True
+
+
+def require_whisper_processor() -> bool:
+    """Ensure whisper_processor is loaded and ready."""
+    if whisper_processor is None:
+        logger.warning("Whisper processor not loaded yet.")
+        return False
+    return True
+
+
+def require_indic_model() -> bool:
+    """Ensure indic_model is loaded and ready."""
+    if indic_model is None:
+        logger.warning("Indic-Conformer model not loaded yet.")
+        return False
+    return True
+
+
+async def load_models_async():
+    global whisper_model, whisper_processor, indic_model, models_loading, models_loaded
+    
+    models_loading = True
+    try:
+        logger.info("Loading Multi-Indic Language Models...")
+        
+        # Load Whisper Processor with tuple handling
+        logger.info("Loading Whisper processor from local cache...")
+        processor_result = WhisperProcessor.from_pretrained(
+            Config.WHISPER_MODEL,
+            **Config.get_model_kwargs()
+        )
+        
+        # Handle tuple return - extract only the processor
+        if isinstance(processor_result, tuple):
+            whisper_processor = processor_result[0]  # Extract processor from tuple
+            logger.info("Whisper processor extracted from tuple return")
+        else:
+            whisper_processor = processor_result  # Direct assignment
+            logger.info("Whisper processor loaded directly")
+        
+        logger.info("Whisper processor loaded successfully from local cache")
+        
+        # Load Whisper Model (unchanged)
+        logger.info("Loading Whisper model from local cache...")
+        whisper_model = WhisperForConditionalGeneration.from_pretrained(
+            Config.WHISPER_MODEL,
+            **Config.get_model_kwargs(),
+            device_map="auto" if Config.get_device() == "cuda" else None
+        )
+        logger.info("Whisper model loaded successfully from local cache")
+        
+        # Load Indic model (existing code continues...)
+        logger.info("Loading Indic-Conformer (will skip if not cached)...")
+        try:
+            indic_model = AutoModel.from_pretrained(
+                Config.INDIC_MODEL,
+                trust_remote_code=True,
+                cache_dir=Config.MODEL_CACHE_DIR,
+                local_files_only=Config.USE_OFFLINE_MODELS
+            )
+            logger.info("Indic-Conformer loaded successfully")
+        except Exception as ind_err:
+            logger.warning(f"Indic-Conformer not available offline: {ind_err}")
+            indic_model = None
+
+        models_loaded = True
+        logger.info("All models ready (offline mode)")
+
+    except Exception as e:
+        logger.error(f"Model load failed: {e}")
+        logger.error(traceback.format_exc())
+        models_loaded = False
+    finally:
+        models_loading = False
+
+
+# Enhanced language detection from our conversation history
+def detect_language_from_output(predicted_ids) -> str:
+    """Enhanced language detection for all Indic languages"""
+    if not require_whisper_processor():
+        return 'en'
+    
+    if whisper_processor is None:
+        logger.error("Whisper processor is not loaded (None) at batch_decode in detect_language_from_output.")
+        return 'en'
+    text = whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+    
+    language_patterns = {
+        'hi': ['अ', 'आ', 'इ', 'ई', 'उ', 'ऊ', 'क', 'ख', 'ग', 'घ'],
+        'bn': ['অ', 'আ', 'ই', 'ঈ', 'উ', 'ঊ', 'ক', 'খ', 'গ', 'ঘ'],
+        'pa': ['ਅ', 'ਆ', 'ਇ', 'ਈ', 'ਉ', 'ਊ', 'ਕ', 'ਖ', 'ਗ', 'ਘ'],
+        'ta': ['அ', 'ஆ', 'இ', 'ஈ', 'உ', 'ஊ', 'க', 'ங', 'ச', 'ஞ'],
+        'te': ['అ', 'ఆ', 'ఇ', 'ఈ', 'ఉ', 'ఊ', 'క', 'ఖ', 'గ', 'ఘ'],
+        'ml': ['അ', 'ആ', 'ഇ', 'ഈ', 'ഉ', 'ഊ', 'ക', 'ഖ', 'ഗ', 'ഘ'],
+        'kn': ['ಅ', 'ಆ', 'ಇ', 'ಈ', 'ಉ', 'ಊ', 'ಕ', 'ಖ', 'ಗ', 'ಘ'],
+        'gu': ['અ', 'આ', 'ઇ', 'ઈ', 'ઉ', 'ઊ', 'ક', 'ખ', 'ગ', 'ઘ'],
+        'ur': ['ا', 'آ', 'ب', 'پ', 'ت', 'ٹ', 'د', 'ڈ', 'ر', 'ڑ'],
+    }
+    
+    language_scores = {}
+    for lang_code, patterns in language_patterns.items():
+        score = sum(1 for char in patterns if char in text)
+        if score > 0:
+            language_scores[lang_code] = score
+    
+    return max(language_scores, key=lambda x: language_scores[x]) if language_scores else 'en'
+
+
+def get_language_description(language_code: str) -> dict:
+    """Get language description in native script"""
+    descriptions = {
+        'hi': {'native_name': 'हिन्दी', 'english_name': 'Hindi', 
+               'description': 'यह हिन्दी भाषा में आपकी आवाज़ को टेक्स्ट में परिवर्तित किया गया है।'},
+        'bn': {'native_name': 'বাংলা', 'english_name': 'Bengali',
+               'description': 'এটি বাংলা ভাষায় আপনার কণ্ঠস্বরকে টেক্সটে রূপান্তরিত করা হয়েছে।'},
+        'pa': {'native_name': 'ਪੰਜਾਬੀ', 'english_name': 'Punjabi',
+               'description': 'ਇਹ ਪੰਜਾਬੀ ਭਾਸ਼ਾ ਵਿੱਚ ਤੁਹਾਡੀ ਆਵਾਜ਼ ਨੂੰ ਟੈਕਸਟ ਵਿੱਚ ਬਦਲਿਆ ਗਿਆ ਹੈ।'},
+        'ta': {'native_name': 'தமிழ்', 'english_name': 'Tamil',
+               'description': 'இது தமிழ் மொழியில் உங்கள் குரலை உரையாக மாற்றப்பட்டுள்ளது।'},
+        'te': {'native_name': 'తెలుగు', 'english_name': 'Telugu',
+               'description': 'ఇది తెలుగు భాషలో మీ స్వరాన్ని టెక్స్ట్‌గా మార్చబడింది।'},
+        'ml': {'native_name': 'മലയാളം', 'english_name': 'Malayalam',
+               'description': 'ഇത് മലയാളം ഭാഷയിൽ നിങ്ങളുടെ ശബ്ദത്തെ ടെക്സ്റ്റിലേക്ക് മാറ്റിയിരിക്കുന്നു।'},
+        'kn': {'native_name': 'ಕನ್ನಡ', 'english_name': 'Kannada',
+               'description': 'ಇದು ಕನ್ನಡ ಭಾಷೆಯಲ್ಲಿ ನಿಮ್ಮ ಧ್ವನಿಯನ್ನು ಪಠ್ಯಕ್ಕೆ ಪರಿವರ್ತಿಸಲಾಗಿದೆ।'},
+        'gu': {'native_name': 'ગુજરાતી', 'english_name': 'Gujarati',
+               'description': 'આ ગુજરાતી ભાષામાં તમારા અવાજને ટેક્સ્ટમાં બદલવામાં આવ્યો છે।'},
+        'ur': {'native_name': 'اردو', 'english_name': 'Urdu',
+               'description': 'یہ اردو زبان میں آپ کی آواز کو متن میں تبدیل کیا گیا ہے۔'},
+        'en': {'native_name': 'English', 'english_name': 'English',
+               'description': 'This is your voice converted to text in English language.'}
+    }
+    return descriptions.get(language_code, descriptions['en'])
+
+
+def validate_audio_file(file: UploadFile) -> bool:
+    """Validate uploaded audio file"""
+    if not file.filename:
+        return False
+    
+    # Check file size
+    if hasattr(file, 'size') and file.size is not None and file.size > Config.MAX_FILE_SIZE:
+        return False
+    
+    file_extension = os.path.splitext(file.filename.lower())[1]
+    return file_extension in SUPPORTED_FORMATS
+
+
+def preprocess_audio(audio_path: str, target_sr: Optional[int] = None) -> np.ndarray:
+    """Preprocess audio file for model input"""
+    if target_sr is None:
+        target_sr = Config.SAMPLE_RATE
+
+    try:
+        # Ensure target_sr is an integer before passing to librosa
+        sr_to_use = int(target_sr) if target_sr is not None else Config.SAMPLE_RATE
+        # Load audio with librosa
+        audio, sr = librosa.load(audio_path, sr=sr_to_use, mono=True)
+        
+        # Normalize audio
+        if len(audio) > 0:
+            audio = audio / np.max(np.abs(audio))
+        
+        return audio
+    except Exception as e:
+        logger.error(f"Error preprocessing audio: {str(e)}")
+        raise e
+
+
+def transcribe_with_whisper(audio_path: str, language: Optional[str] = None) -> dict:
+    """Transcribe audio using Whisper model with enhanced error handling"""
+    try:
+        # Check if all Whisper components are loaded
+        if not require_whisper_processor():
+            return {
+                'text': '',
+                'language': 'en',
+                'language_info': get_language_description('en'),
+                'confidence': 0.0,
+                'error': 'Whisper processor is still loading. Please try again in a few moments.'
+            }
+        
+        if not require_whisper_model():
+            return {
+                'text': '',
+                'language': 'en',
+                'language_info': get_language_description('en'),
+                'confidence': 0.0,
+                'error': 'Whisper model is still loading. Please try again in a few moments.'
+            }
+        
+        # Load and preprocess audio for Whisper
+        audio_array, sampling_rate = librosa.load(audio_path, sr=Config.SAMPLE_RATE, mono=True)
+        
+        # Verify audio loaded successfully
+        if len(audio_array) == 0:
+            raise ValueError("Audio array is empty - check audio file format")
+        
+        # Process with Whisper processor
+        if whisper_processor is None:
+            logger.error("Whisper processor is not loaded (None) at input_features.")
+            return {
+                'text': '',
+                'language': 'en',
+                'language_info': get_language_description('en'),
+                'confidence': 0.0,
+                'error': 'Whisper processor is not loaded. Please try again later.'
+            }
+        input_features = whisper_processor(
+            audio_array, 
+            sampling_rate=Config.SAMPLE_RATE, 
+            return_tensors="pt"
+        ).input_features
+        
+        # Move to appropriate device
+        if Config.get_device() == "cuda":
+            input_features = input_features.to("cuda")
+        
+        # Generate transcription
+        if language and language in WHISPER_TO_INDIC_MAPPING:
+            # Force specific language
+            if whisper_processor is None:
+                logger.error("Whisper processor is not loaded (None) at get_decoder_prompt_ids.")
+                return {
+                    'text': '',
+                    'language': 'en',
+                    'language_info': get_language_description('en'),
+                    'confidence': 0.0,
+                    'error': 'Whisper processor is not loaded. Please try again later.'
+                }
+            forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(
+                language=language, 
+                task="transcribe"
+            )
+            if whisper_model is None:
+                logger.error("Whisper model is not loaded (None) at generate.")
+                return {
+                    'text': '',
+                    'language': 'en',
+                    'language_info': get_language_description('en'),
+                    'confidence': 0.0,
+                    'error': 'Whisper model is not loaded. Please try again later.'
+                }
+            predicted_ids = whisper_model.generate(
+                input_features, 
+                forced_decoder_ids=forced_decoder_ids
+            )
+            detected_lang = language
+        else:
+            # Let model detect language
+            if whisper_model is None:
+                logger.error("Whisper model is not loaded (None) at generate.")
+                return {
+                    'text': '',
+                    'language': 'en',
+                    'language_info': get_language_description('en'),
+                    'confidence': 0.0,
+                    'error': 'Whisper model is not loaded. Please try again later.'
+                }
+            predicted_ids = whisper_model.generate(input_features)
+            detected_lang = detect_language_from_output(predicted_ids)
+        
+        # Decode the transcription
+        if whisper_processor is None:
+            logger.error("Whisper processor is not loaded (None) at batch_decode.")
+            return {
+                'text': '',
+                'language': 'en',
+                'language_info': get_language_description('en'),
+                'confidence': 0.0,
+                'error': 'Whisper processor is not loaded. Please try again later.'
+            }
+        transcription = whisper_processor.batch_decode(
+            predicted_ids, 
+            skip_special_tokens=True
+        )[0].strip()
+        
+        language_info = get_language_description(detected_lang)
+        
+        logger.info(f"Whisper detected language: {detected_lang}")
+        logger.info(f"Whisper transcription: {transcription[:100]}...")
+        
+        return {
+            'text': transcription,
+            'language': detected_lang,
+            'language_info': language_info,
+            'confidence': 0.9
+        }
+        
+    except Exception as e:
+        logger.error(f"Whisper transcription error: {str(e)}")
+        return {
+            'text': '',
+            'language': 'en',
+            'language_info': get_language_description('en'),
+            'confidence': 0.0,
+            'error': str(e)
+        }
+
+
+def transcribe_with_indic(audio: np.ndarray, language: str) -> Optional[str]:
+    """Transcribe audio using Indic-Conformer model with enhanced safety checks"""
+    try:
+        # Check if Indic model is loaded
+        if not require_indic_model():
+            logger.warning("Indic-Conformer model not loaded")
+            return None
+        
+        # Validate language support
+        if indic_model is not None and hasattr(indic_model, 'language_masks'):
+            if language not in indic_model.language_masks:
+                logger.warning(f"Language '{language}' not supported by Indic-Conformer, falling back to Hindi")
+                language = 'hi'
+        
+        # Perform CTC transcription
+        if indic_model is None:
+            logger.error("Indic-Conformer model is not loaded (None) when attempting transcription.")
+            return None
+        result = indic_model(audio, language, "ctc")
+        
+        if isinstance(result, str):
+            return result.strip()
+        elif hasattr(result, 'text'):
+            return result.text.strip()
+        else:
+            logger.warning("Unexpected result format from Indic-Conformer")
+            return None
+            
+    except KeyError as e:
+        logger.error(f"Language key error in Indic-Conformer: {str(e)}")
+        # Try with Hindi as fallback
+        try:
+            if indic_model is not None:
+                result = indic_model(audio, 'hi', "ctc")
+                return result.text.strip() if hasattr(result, 'text') else str(result).strip()
+            else:
+                logger.error("Indic-Conformer model is not loaded (None) during fallback transcription.")
+                return None
+        except Exception as fallback_error:
+            logger.error(f"Fallback transcription also failed: {str(fallback_error)}")
+            return None
+    except Exception as e:
+        logger.error(f"Indic-Conformer transcription error: {str(e)}")
+        return None
+
+
+# Middleware to check model loading status
+@app.middleware("http")
+async def check_models_middleware(request: Request, call_next):
+    """Middleware to ensure models are ready for transcription endpoints"""
+    # Skip middleware for health, status, and root endpoints
+    if request.url.path in ["/", "/health", "/models/status", "/config", "/docs", "/openapi.json"]:
+        return await call_next(request)
+    
+    # For transcription endpoints, check if models are loaded
+    if request.url.path.startswith("/transcribe"):
+        if models_loading:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "loading",
+                    "message": "Models are still loading. Please wait.",
+                    "retry_after": 30
+                }
+            )
+        
+        if not models_loaded or not all([whisper_model, whisper_processor]):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unavailable",
+                    "message": "Models failed to load or are not ready. Please check service logs.",
+                    "models": check_all_models_loaded()
+                }
+            )
+    
+    return await call_next(request)
+
+
+# Enhanced endpoints
+@app.get("/")
+async def root():
+    """Root endpoint with comprehensive service information"""
+    model_status = check_all_models_loaded()
+    
+    return {
+        "message": "Multi-Indic Language Speech-to-Text API",
+        "version": "2.0.0",
+        "description": "Advanced FastAPI service for transcribing audio in 22+ Indian languages with native script output",
+        "supported_formats": list(SUPPORTED_FORMATS),
+        "supported_languages": list(WHISPER_TO_INDIC_MAPPING.keys()),
+        "language_families": {
+            "Indo-European": ["hi", "bn", "pa", "gu", "mr", "or", "as", "ur", "ne", "ks", "sd", "sa", "mai", "doi", "kok"],
+            "Dravidian": ["ta", "te", "kn", "ml"],
+            "Sino-Tibetan": ["mni", "brx"],
+            "Austro-Asiatic": ["sit"]
+        },
+        "max_file_size_mb": Config.MAX_FILE_SIZE // (1024 * 1024),
+        "sample_rate": Config.SAMPLE_RATE,
+        "device": Config.get_device(),
+        "models": {
+            "whisper": Config.WHISPER_MODEL,
+            "indic": Config.INDIC_MODEL
+        },
+        "model_status": model_status,
+        "offline_mode": Config.USE_OFFLINE_MODELS,
+        "cache_directory": Config.MODEL_CACHE_DIR,
+        "endpoints": {
+            "transcribe": "/transcribe",
+            "transcribe_batch": "/transcribe-batch",
+            "health": "/health",
+            "config": "/config",
+            "models_status": "/models/status",
+            "gpu_status": "/gpu-status",
+            "docs": "/docs"
+        }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Enhanced health check endpoint"""
+    model_status = check_all_models_loaded()
+    
+    # Modified to work even if Indic model is not available
+    whisper_ready = model_status["whisper_model_loaded"] and model_status["whisper_processor_loaded"]
+    
+    if whisper_ready:
+        return {"status": "healthy", "models": model_status}
+    elif model_status["models_loading"]:
+        raise HTTPException(
+            status_code=503, 
+            detail={
+                "status": "loading", 
+                "message": "Models are still loading. Please wait.",
+                "models": model_status
+            }
+        )
+    else:
+        raise HTTPException(
+            status_code=503, 
+            detail={
+                "status": "unhealthy", 
+                "message": "Essential models failed to load.",
+                "models": model_status
+            }
+        )
+
+
+@app.get("/models/status")
+async def models_status():
+    """Detailed model loading status"""
+    return {
+        "models": check_all_models_loaded(),
+        "loading_progress": {
+            "whisper_processor": {
+                "loaded": whisper_processor is not None,
+                "model_name": Config.WHISPER_MODEL
+            },
+            "whisper_model": {
+                "loaded": whisper_model is not None,
+                "model_name": Config.WHISPER_MODEL
+            },
+            "indic_model": {
+                "loaded": indic_model is not None,
+                "model_name": Config.INDIC_MODEL
+            }
+        },
+        "device_info": {
+            "current_device": Config.get_device(),
+            "gpu_available": torch.cuda.is_available(),
+            "gpu_info": Config.get_gpu_info() if hasattr(Config, 'get_gpu_info') else None
+        },
+        "offline_config": {
+            "offline_mode": Config.USE_OFFLINE_MODELS,
+            "cache_directory": Config.MODEL_CACHE_DIR
+        }
+    }
+
+
+@app.get("/gpu-status")
+async def gpu_status():
+    """GPU status and memory information"""
+    if torch.cuda.is_available():
+        return {
+            "gpu_available": True,
+            "gpu_count": torch.cuda.device_count(),
+            "current_device": torch.cuda.current_device(),
+            "device_name": torch.cuda.get_device_name(),
+            "memory_allocated": torch.cuda.memory_allocated(),
+            "memory_reserved": torch.cuda.memory_reserved(),
+            "memory_allocated_mb": torch.cuda.memory_allocated() / 1024 / 1024,
+            "memory_reserved_mb": torch.cuda.memory_reserved() / 1024 / 1024
+        }
+    else:
+        return {"gpu_available": False, "message": "CUDA not available"}
+
+
+@app.get("/languages")
+async def get_supported_languages():
+    """Get detailed information about supported languages"""
+    languages = {}
+    for lang_code in WHISPER_TO_INDIC_MAPPING.keys():
+        languages[lang_code] = get_language_description(lang_code)
+    
+    return {
+        "total_languages": len(languages),
+        "language_families": {
+            "Indo-European": 15,
+            "Dravidian": 4,
+            "Sino-Tibetan": 2,
+            "Austro-Asiatic": 1
+        },
+        "languages": languages
+    }
+
+
+@app.post("/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    language: Optional[str] = None,
+    use_indic: bool = True
+):
+    """
+    Enhanced transcribe endpoint with better error handling and native script output
+    """
+    
+    # Validate file
+    if not validate_audio_file(file):
+        raise HTTPException(
+            status_code=400, 
+            detail={
+                "error": "Invalid file",
+                "supported_formats": list(SUPPORTED_FORMATS),
+                "max_size_mb": Config.MAX_FILE_SIZE // (1024 * 1024)
+            }
+        )
+    
+    # Validate language if provided
+    if language and language not in WHISPER_TO_INDIC_MAPPING:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Unsupported language: {language}",
+                "supported_languages": list(WHISPER_TO_INDIC_MAPPING.keys())
+            }
+        )
+    
+    # Create temporary file
+    temp_dir = tempfile.mkdtemp()
+    temp_filename = f"{uuid.uuid4()}_{file.filename}"
+    temp_path = os.path.join(temp_dir, temp_filename)
+    
+    try:
+        # Save uploaded file
+        content = await file.read()
+        
+        # Check file size
+        if len(content) > Config.MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size: {Config.MAX_FILE_SIZE // (1024 * 1024)}MB"
+            )
+        
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        
+        logger.info(f"Processing file: {file.filename} ({len(content)} bytes)")
+        
+        # Transcribe with Whisper
+        whisper_result = transcribe_with_whisper(temp_path, language)
+        detected_lang = whisper_result['language']
+        
+        response_data = {
+            "filename": file.filename,
+            "file_size_bytes": len(content),
+            "processing_config": {
+                "sample_rate": Config.SAMPLE_RATE,
+                "device": Config.get_device(),
+                "requested_language": language,
+                "use_indic": use_indic,
+                "offline_mode": Config.USE_OFFLINE_MODELS
+            },
+            "whisper": whisper_result,
+            "indic": None,
+            "final_language": detected_lang,
+            "language_info": whisper_result.get('language_info', get_language_description(detected_lang))
+        }
+        
+        # Use Indic-Conformer for Indian languages if requested and model is available
+        if use_indic and detected_lang in WHISPER_TO_INDIC_MAPPING and require_indic_model():
+            # Preprocess audio for Indic-Conformer
+            audio_array = preprocess_audio(temp_path, Config.SAMPLE_RATE)
+            
+            # Map language code
+            indic_lang = WHISPER_TO_INDIC_MAPPING[detected_lang]
+            
+            # Transcribe with Indic-Conformer
+            indic_result = transcribe_with_indic(audio_array, indic_lang)
+            
+            response_data["indic"] = {
+                "text": indic_result,
+                "language": indic_lang
+            }
+            response_data["final_language"] = indic_lang
+        
+        # Determine best transcription
+        if response_data["indic"] and response_data["indic"]["text"]:
+            response_data["best_transcription"] = response_data["indic"]["text"]
+            response_data["transcription_source"] = "indic-conformer"
+        else:
+            response_data["best_transcription"] = response_data["whisper"]["text"]
+            response_data["transcription_source"] = "whisper"
+        
+        return JSONResponse(content=response_data)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Transcription error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Transcription failed",
+                "detail": str(e),
+                "filename": file.filename if file else "unknown"
+            }
+        )
+    
+    finally:
+        # Cleanup temporary files
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            os.rmdir(temp_dir)
+        except Exception as cleanup_error:
+            logger.warning(f"Cleanup error: {cleanup_error}")
+
+
+@app.post("/transcribe-batch")
+async def transcribe_batch(
+    files: list[UploadFile] = File(...),
+    language: Optional[str] = None,
+    use_indic: bool = True
+):
+    """Enhanced batch transcription with better error handling"""
+    
+    # Validate batch size
+    if len(files) > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Too many files. Maximum batch size is 10 files."
+        )
+    
+    results = []
+    total_size = 0
+    
+    # Pre-validate all files
+    for file in files:
+        if not validate_audio_file(file):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"Invalid file: {file.filename}",
+                    "supported_formats": list(SUPPORTED_FORMATS)
+                }
+            )
+        total_size += getattr(file, 'size', Config.MAX_FILE_SIZE // 10)
+    
+    if total_size > Config.MAX_FILE_SIZE * 5:
+        raise HTTPException(
+            status_code=413,
+            detail="Total batch size too large"
+        )
+    
+    for i, file in enumerate(files):
+        try:
+            logger.info(f"Processing batch file {i+1}/{len(files)}: {file.filename}")
+            
+            # Reset file pointer
+            await file.seek(0)
+            
+            # Process each file individually
+            result = await transcribe_audio(file, language, use_indic)
+            if isinstance(result, JSONResponse):
+                import json
+                results.append(json.loads(bytes(result.body).decode()))
+            else:
+                results.append(result)
+                
+        except Exception as e:
+            logger.error(f"Error processing file {file.filename}: {str(e)}")
+            results.append({
+                "filename": file.filename,
+                "error": str(e),
+                "status": "failed"
+            })
+    
+    return JSONResponse(content={
+        "batch_results": results,
+        "total_files": len(files),
+        "successful": len([r for r in results if "error" not in str(r)]),
+        "failed": len([r for r in results if "error" in str(r)]),
+        "processing_summary": {
+            "total_size_mb": total_size / (1024 * 1024),
+            "avg_file_size_mb": (total_size / len(files)) / (1024 * 1024),
+            "offline_mode": Config.USE_OFFLINE_MODELS
+        }
+    })
+
+
+@app.get("/config")
+async def get_config():
+    """Enhanced configuration endpoint"""
+    return {
+        "service_info": {
+            "name": "Multi-Indic Language Speech-to-Text API",
+            "version": "2.0.0",
+            "description": "Advanced FastAPI service for 22+ Indian languages"
+        },
+        "models": {
+            "whisper": Config.WHISPER_MODEL,
+            "indic": Config.INDIC_MODEL
+        },
+        "offline_config": {
+            "offline_mode": Config.USE_OFFLINE_MODELS,
+            "cache_directory": Config.MODEL_CACHE_DIR
+        },
+        "audio_config": {
+            "sample_rate": Config.SAMPLE_RATE,
+            "max_file_size_mb": Config.MAX_FILE_SIZE // (1024 * 1024),
+            "supported_formats": list(Config.SUPPORTED_FORMATS)
+        },
+        "languages": {
+            "total_supported": len(Config.WHISPER_TO_INDIC_MAPPING),
+            "language_codes": list(Config.WHISPER_TO_INDIC_MAPPING.keys()),
+            "families": {
+                "Indo-European": 15,
+                "Dravidian": 4,
+                "Sino-Tibetan": 2,
+                "Austro-Asiatic": 1
+            }
+        },
+        "device_config": {
+            "use_gpu": Config.USE_GPU,
+            "current_device": Config.get_device(),
+            "cuda_available": torch.cuda.is_available()
+        },
+        "model_status": check_all_models_loaded()
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
