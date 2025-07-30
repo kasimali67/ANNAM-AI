@@ -1,0 +1,342 @@
+
+import os
+import re
+import uuid
+import torch
+import librosa
+import numpy as np
+import tempfile
+import soundfile as sf
+import logging
+import json
+from typing import Dict, List, Any, Optional
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+# --- Model & Processing Imports ---
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from fuzzywuzzy import process as fuzzy_process
+from googletrans import Translator
+
+# --- External Language Identification (LID) Imports ---
+import langdetect
+import langid
+# import cld3  # Comment out if not installed/compatible
+
+# --- Import from our separate config file ---
+from config import Config, LANGUAGE_PATTERNS, CANDIDATE_LANGUAGES
+
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Global Model Variables ---
+whisper_model = None
+whisper_processor = None
+translator = None
+language_data = {} # To cache wordlists and other data
+
+# ==============================================================================
+# DATA LOADING (Used in Lifespan) - OFFLINE VERSION
+# ==============================================================================
+
+async def load_models_and_data():
+    """Loads Whisper Large model and linguistic data from local storage on startup."""
+    global whisper_model, whisper_processor, translator, language_data, models_loading, models_loaded
+    
+    models_loading = True
+    try:
+        if whisper_model is None:
+            logger.info(f"Loading Whisper LARGE model '{Config.MODEL_NAME}' from local cache at {Config.MODEL_CACHE_DIR} onto {Config.get_device()}...")
+            
+            # --- Large Model: Enhanced memory management ---
+            if Config.get_device() == "cuda":
+                torch.cuda.empty_cache()  # Clear GPU cache for large model
+            
+            # --- Processor loading with tuple safety and your original config ---
+            processor_result = WhisperProcessor.from_pretrained(
+                Config.MODEL_NAME,
+                **Config.get_model_kwargs()
+            )
+            if isinstance(processor_result, tuple):
+                whisper_processor = processor_result[0]
+            else:
+                whisper_processor = processor_result
+            logger.info("Whisper processor loaded successfully from local cache")
+            
+            # --- Large Model: Explicit loading with memory optimization ---
+            logger.info("Loading Whisper Large model - this may take a moment due to model size...")
+            base_model = WhisperForConditionalGeneration.from_pretrained(
+                Config.MODEL_NAME,
+                **Config.get_model_kwargs(),
+                torch_dtype=torch.float16 if Config.get_device() == "cuda" else torch.float32,
+                device_map="auto" if Config.get_device() == "cuda" else None
+            )
+            
+            # Move large model to device (if not already handled by device_map)
+            if Config.get_device() != "cuda":  # device_map="auto" handles GPU placement
+                whisper_model = base_model.to(Config.get_device())
+            else:
+                whisper_model = base_model
+            
+            # Enable eval mode for inference efficiency
+            whisper_model.eval()
+            
+            translator = Translator()
+            logger.info(f"Whisper Large model loaded successfully on {Config.get_device()}")
+
+        # --- Wordlist loading (enhanced with error handling) ---
+        logger.info(f"Loading wordlists from: {Config.DATA_PATH}")
+        for lang_name, (lang_code, _, _) in LANGUAGE_PATTERNS.items():
+            if lang_code not in language_data:
+                common_words_path = os.path.join(Config.DATA_PATH, f"{lang_code}_common.txt")
+                try:
+                    if os.path.exists(common_words_path):
+                        with open(common_words_path, 'r', encoding='utf-8') as f:
+                            language_data[lang_code] = {'common_words': [line.strip() for line in f if line.strip()]}
+                        logger.info(f"Loaded {len(language_data[lang_code]['common_words'])} common words for {lang_name} ({lang_code}).")
+                    else:
+                        language_data[lang_code] = {'common_words': []}
+                        logger.warning(f"No wordlist found for {lang_name} at {common_words_path}.")
+                except Exception as e:
+                    logger.error(f"Error loading wordlist for {lang_name}: {e}")
+                    language_data[lang_code] = {'common_words': []}
+        
+        models_loaded = True
+        logger.info("Whisper Large model and language data loaded successfully from local storage.")
+        
+    except Exception as e:
+        logger.error(f"Model load failed: {e}")
+        logger.error(traceback.format_exc())
+        models_loaded = False
+        raise  # Re-raise to handle in calling code
+    finally:
+        models_loading = False
+
+# --- Keep your original helper functions (they're useful!) ---
+def require_whisper_model() -> bool:
+    if whisper_model is None:
+        logger.warning("Whisper model not loaded yet.")
+        return False
+    return True
+
+def require_whisper_processor() -> bool:
+    if whisper_processor is None:
+        logger.warning("Whisper processor not loaded yet.")
+        return False
+    return True
+
+# --- Enhanced helper for checking if everything is ready ---
+def require_all_models() -> bool:
+    return require_whisper_model() and require_whisper_processor()
+
+
+
+# ==============================================================================
+# COMPREHENSIVE 5-STEP PIPELINE FUNCTIONS
+# ==============================================================================
+
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r'\b\w+\b', text)
+
+def _decode_all_candidates(audio_path: str) -> Dict[str, Dict[str, Any]]:
+    # --- Defensive check for processor ---
+    if whisper_processor is None or not callable(whisper_processor):
+        raise RuntimeError("Whisper processor is not loaded or not callable!")
+    
+    results = {}
+    audio_input, _ = librosa.load(audio_path, sr=Config.SAMPLE_RATE)
+    input_features = whisper_processor(audio_input, sampling_rate=Config.SAMPLE_RATE, return_tensors="pt").input_features
+    input_features = input_features.to(Config.DEVICE)
+
+    for lang_code in CANDIDATE_LANGUAGES:
+        with torch.no_grad():
+            forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(language=lang_code, task="transcribe")
+            predicted_ids = whisper_model.generate(
+                input_features,
+                forced_decoder_ids=forced_decoder_ids,
+                return_dict_in_generate=True,
+                output_scores=True
+            )
+        
+        transition_scores = whisper_model.compute_transition_scores(predicted_ids.sequences, predicted_ids.scores, normalize_logits=True)
+        sequence_confidence = torch.exp(transition_scores.sum(-1) / (transition_scores.shape[-1] + 1e-8)).item()
+        transcription = whisper_processor.batch_decode(predicted_ids.sequences, skip_special_tokens=True)[0]
+        results[lang_code] = {'text': transcription.strip(), 'confidence': sequence_confidence}
+    return results
+
+def _calculate_script_score(text: str, lang_code: str) -> float:
+    unicode_range = next((details[2] for details in LANGUAGE_PATTERNS.values() if details[0] == lang_code), None)
+    if not unicode_range or not text: return 0.0
+    native_chars = re.findall(unicode_range, text)
+    clean_text = re.sub(r'\s+', '', text)
+    return len(native_chars) / len(clean_text) if clean_text else 0.0
+
+def _calculate_wordlist_score(text: str, lang_code: str) -> float:
+    if lang_code not in language_data or not language_data[lang_code]['common_words'] or not text: return 0.0
+    tokens = _tokenize(text)
+    if not tokens: return 0.0
+    common_words_set = language_data[lang_code]['common_words']
+    match_count = 0
+    for token in tokens:
+        best_match = fuzzy_process.extractOne(token, common_words_set)
+        if best_match and best_match[1] > 85: match_count += 1
+    return match_count / len(tokens)
+
+def _run_external_lid(text: str) -> Dict[str, Dict[str, Any]]:
+    if not text.strip(): return {}
+    results = {}
+    try:
+        results['langdetect'] = {'lang': langdetect.detect(text), 'confidence': 1.0}
+    except Exception:
+        results['langdetect'] = {'lang': 'err', 'confidence': 0.0}
+    try:
+        lang, conf = langid.classify(text)
+        results['langid'] = {'lang': lang, 'confidence': conf}
+    except Exception:
+        results['langid'] = {'lang': 'err', 'confidence': 0.0}
+    # Note: cld3 commented out based on previous compatibility issues
+    # try:
+    #     res = cld3.get_language(text)
+    #     results['cld3'] = {'lang': res.language if res else 'err', 'confidence': res.probability if res else 0.0}
+    # except Exception:
+    #     results['cld3'] = {'lang': 'err', 'confidence': 0.0}
+    return results
+
+def _calculate_ensemble_decision(all_results: Dict[str, Any]) -> Dict[str, Any]:
+    final_scores = {}
+    weights = {'whisper_confidence': 0.30, 'script_score': 0.25, 'wordlist_score': 0.25, 'lid_consensus': 0.20}
+
+    for lang_code, result in all_results.items():
+        scores = {}
+        scores['whisper_confidence'] = result['whisper']['confidence']
+        scores['script_score'] = _calculate_script_score(result['whisper']['text'], lang_code)
+        scores['wordlist_score'] = _calculate_wordlist_score(result['whisper']['text'], lang_code)
+        
+        lid_score = 0
+        if result['lid']:
+            lid_matches = [res['confidence'] for res in result['lid'].values() if res['lang'] == lang_code]
+            lid_score = sum(lid_matches) / len(result['lid']) if lid_matches else 0.0
+        scores['lid_consensus'] = lid_score
+        
+        composite_score = sum(scores[key] * weights[key] for key in weights)
+        final_scores[lang_code] = {'composite_score': composite_score, 'breakdown': scores, 'text': result['whisper']['text']}
+        
+    best_lang = max(final_scores, key=lambda k: final_scores[k]['composite_score'])
+    return {'best_lang': best_lang, 'details': final_scores[best_lang]}
+
+def _validate_confidence(decision: Dict[str, Any]) -> Dict[str, Any]:
+    details, breakdown = decision['details'], decision['details']['breakdown']
+    score_variance = np.var(list(breakdown.values())).item()
+    return {
+        'overall_confidence': details['composite_score'],
+        'is_high_confidence': details['composite_score'] > 0.7,
+        'is_consistent_across_metrics': score_variance < 0.1
+    }
+
+def translate_to_english(text: str, src_lang: str) -> Optional[str]:
+    if not text: return None
+    try:
+        return translator.translate(text, src=src_lang, dest='en').text
+    except Exception as e:
+        logger.error(f"Translation failed for lang {src_lang}: {e}")
+        return f"[Translation Error: {e}]"
+
+# ==============================================================================
+# MAIN WORKFLOW FUNCTION
+# ==============================================================================
+
+def transcribe_audio_fully_comprehensive(audio_path: str) -> Dict[str, Any]:
+    if not os.path.exists(audio_path): raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    
+    decoded_results = _decode_all_candidates(audio_path)
+    full_analysis_data = {
+        lang_code: {'whisper': whisper_res, 'lid': _run_external_lid(whisper_res['text'])}
+        for lang_code, whisper_res in decoded_results.items()
+    }
+    final_decision = _calculate_ensemble_decision(full_analysis_data)
+    best_lang_code = final_decision['best_lang']
+    native_transcription = final_decision['details']['text']
+    english_translation = translate_to_english(native_transcription, best_lang_code)
+    quality_report = _validate_confidence(final_decision)
+    
+    return {
+        'detected_language_code': best_lang_code,
+        'detected_language_name': next(name for name, details in LANGUAGE_PATTERNS.items() if details[0] == best_lang_code),
+        'transcription': {
+            'native_script': native_transcription,
+            'english_translation': english_translation
+        },
+        'confidence_and_quality': {
+            'final_composite_score': final_decision['details']['composite_score'],
+            'score_breakdown': final_decision['details']['breakdown'],
+            'quality_indicators': quality_report
+        }
+    }
+
+# ==============================================================================
+# FASTAPI APPLICATION
+# ==============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting Multi-Indic ASR Service with local models...")
+    await load_models_and_data()
+    yield
+    logger.info("Shutting down service.")
+
+app = FastAPI(
+    title="Comprehensive Multi-Indic ASR & Translation API",
+    description="A high-accuracy API for transcribing 22 Indian languages with parallel English translation.",
+    version="3.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/transcribe", summary="Transcribe an audio file into native script and English")
+async def transcribe_endpoint(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(tuple(Config.SUPPORTED_FORMATS)):
+        raise HTTPException(status_code=400, detail=f"Invalid file type. Supported formats: {Config.SUPPORTED_FORMATS}")
+    
+    temp_dir = tempfile.mkdtemp()
+    temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
+    
+    try:
+        with open(temp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info(f"Processing file: {file.filename}")
+        result = transcribe_audio_fully_comprehensive(temp_path)
+        return JSONResponse(content=result)
+        
+    except Exception as e:
+        logger.error(f"An error occurred during transcription: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        os.rmdir(temp_dir)
+
+@app.get("/", summary="API Health and Information")
+def root():
+    return {
+        "status": "online",
+        "message": "Welcome to the Comprehensive Multi-Indic ASR & Translation API!",
+        "model_loaded": whisper_model is not None,
+        "device": Config.DEVICE,
+        "supported_languages": len(CANDIDATE_LANGUAGES),
+        "offline_mode": True
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
